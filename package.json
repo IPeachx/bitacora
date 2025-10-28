@@ -5,10 +5,10 @@
   "engines": {
     "node": ">=20 <23"
   },
-  "main": "src/index.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "deploy": "node src/deploy-commands.js"
+    "start": "node index.js",
+    "deploy": "node deploy-commands.js"
   },
   "dependencies": {
     "csv-stringify": "^6.5.0",
