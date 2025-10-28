@@ -1,0 +1,22 @@
+{
+  "name": "lolli-bitacora-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20 <23"
+  },
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "deploy": "node src/deploy-commands.js"
+  },
+  "dependencies": {
+    "csv-stringify": "^6.5.0",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "fs-extra": "^11.2.0",
+    "luxon": "^3.5.0",
+    "node-cron": "^3.0.3",
+    "sqlite3": "^5.1.7"
+  }
+}
