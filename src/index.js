@@ -54,14 +54,19 @@ client.once(Events.ClientReady, async (c) => {
    Helpers de permisos/panel
 ========================= */
 
-function userHasBitacoraAccess(interaction) {
-  if (!BITACORA_ROLE_IDS.length) return true; // si no se configuró, cualquiera puede usarlo
+async function userHasBitacoraAccess(interaction) {
+  if (!BITACORA_ROLE_IDS.length) return true; // si no configuraste roles, queda abierto
+
   if (!interaction.guild) return false;
-  const member = interaction.guild.members.cache.get(interaction.user.id);
+  const member = await interaction.guild.members
+    .fetch(interaction.user.id)
+    .catch(() => null);
   if (!member) return false;
-  const memberRoleIds = member.roles.cache.map((r) => r.id);
-  return BITACORA_ROLE_IDS.some((id) => memberRoleIds.includes(id));
+
+  const memberRoleIds = member.roles.cache.map(r => r.id);
+  return BITACORA_ROLE_IDS.some(id => memberRoleIds.includes(id));
 }
+
 
 // Construye el embed del panel con la lista actualizada de usuarios en servicio
 async function buildPanelEmbed(guildId) {
@@ -382,35 +387,89 @@ async function handleSalir(interaction) {
 }
 
 async function handleLista(interaction) {
-  // Permiso por rol para usar 📋 Bitácora
-  if (!userHasBitacoraAccess(interaction)) {
+  if (!(await userHasBitacoraAccess(interaction))) {
     return interaction.reply({ content: 'No tienes permiso para usar 📋 Bitácora.', ephemeral: true });
   }
 
   await interaction.deferReply({ ephemeral: false });
-  const now = DateTime.now().setZone(TZ);
-  const from = now.startOf('day').toMillis();
+
+  const tzNow = DateTime.now().setZone(TZ);
+  const dayStart = tzNow.startOf('day').toMillis();
+
+  // 1) En servicio ahora
   db.all(
-    `SELECT user_id, SUM(min_normales) AS n, SUM(min_estelares) AS e
-     FROM sessions WHERE guild_id=? AND status='closed' AND end_at>=?
-     GROUP BY user_id
-     ORDER BY ( (n/60.0)*1 + (e/60.0)*2 ) DESC
-     LIMIT 15`,
-    [interaction.guildId, from],
-    (err, rows) => {
-      const lines =
-        rows?.map((r, i) => {
-          const coins = ((r.n / 60) * 1 + (r.e / 60) * 2).toFixed(2);
-          return `**${i + 1}.** <@${r.user_id}> — ${coins} coins (Normales ${(r.n / 60).toFixed(2)}h · Estelares ${(r.e / 60).toFixed(2)}h)`;
-        }) || ['—'];
-      const embed = new EmbedBuilder()
-        .setColor(0xf7a8d8)
-        .setTitle('📋 Bitácora — Hoy')
-        .setDescription(lines.join('\n') || ' ');
-      interaction.editReply({ embeds: [embed] });
+    `SELECT user_id, id AS session_id, start_at
+     FROM sessions
+     WHERE guild_id=? AND status='open'`,
+    [interaction.guildId],
+    (eOpen, openRows = []) => {
+      // 2) Cerradas hoy
+      db.all(
+        `SELECT user_id, min_normales AS n, min_estelares AS e
+         FROM sessions
+         WHERE guild_id=? AND status='closed' AND end_at>=?`,
+        [interaction.guildId, dayStart],
+        async (eClosed, closedRows = []) => {
+          if (eOpen || eClosed) return interaction.editReply('Error al consultar la base.');
+
+          // Mapa de acumulado (minutos) por usuario con cerradas hoy
+          const acc = new Map();
+          for (const r of closedRows) {
+            const prev = acc.get(r.user_id) || { n: 0, e: 0 };
+            acc.set(r.user_id, { n: prev.n + (r.n || 0), e: prev.e + (r.e || 0) });
+          }
+
+          // Sumar el tiempo “corriente” de las sesiones abiertas desde el inicio del día
+          getGuildConfig(interaction.guildId, async (err, cfg) => {
+            const tz = cfg?.timezone || TZ;
+            const windows = parseWindows(cfg?.stellar_windows || '00:00-02:00,16:00-18:00');
+
+            for (const s of openRows) {
+              const from = Math.max(s.start_at, dayStart);
+              const to = Date.now();
+              const split = splitMinutesByWindows(from, to, tz, windows); // {normales, estelares}
+              const prev = acc.get(s.user_id) || { n: 0, e: 0 };
+              acc.set(s.user_id, { n: prev.n + split.normales, e: prev.e + split.estelares });
+            }
+
+            // Construir secciones
+            const enServicioTags = openRows.length
+              ? openRows.map(r => `<@${r.user_id}>`).join(' ')
+              : '—';
+
+            const lines = [];
+            // Ordenar por coins (n*1 + e*2) desc
+            const sorted = [...acc.entries()].sort((a, b) => {
+              const A = (a[1].n / 60) * 1 + (a[1].e / 60) * 2;
+              const B = (b[1].n / 60) * 1 + (b[1].e / 60) * 2;
+              return B - A;
+            });
+
+            if (!sorted.length) {
+              lines.push('—');
+            } else {
+              let idx = 1;
+              for (const [userId, v] of sorted) {
+                const coins = ((v.n / 60) * 1 + (v.e / 60) * 2).toFixed(2);
+                lines.push(`**${idx}.** <@${userId}> — ${coins} coins (Normales ${(v.n/60).toFixed(2)}h · Estelares ${(v.e/60).toFixed(2)}h)`);
+                idx++;
+              }
+            }
+
+            const embed = new EmbedBuilder()
+              .setColor(0xf7a8d8)
+              .setTitle('📋 Bitácora — Hoy')
+              .setDescription(lines.join('\n') || ' ')
+              .addFields({ name: 'En servicio ahora', value: enServicioTags });
+
+            await interaction.editReply({ embeds: [embed] });
+          });
+        }
+      );
     }
   );
 }
+
 
 /* =========================
    Cálculo de tiempos y cierre
