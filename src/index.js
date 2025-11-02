@@ -61,6 +61,37 @@ db.serialize(() => {
   )`);
 });
 
+// --- MIGRACIÓN DE ESQUEMA: añade columnas faltantes en guild_config ---
+function ensureGuildConfigColumns() {
+  return new Promise((resolve) => {
+    db.all(`PRAGMA table_info('guild_config')`, [], (e, rows = []) => {
+      if (e) return resolve();
+      const cols = new Set(rows.map(r => r.name));
+
+      const addIfMissing = (name, type = 'TEXT') => new Promise(r =>
+        cols.has(name)
+          ? r()
+          : db.run(`ALTER TABLE guild_config ADD COLUMN ${name} ${type}`, [], () => r())
+      );
+
+      Promise.resolve()
+        .then(() => addIfMissing('panel_channel_id', 'TEXT'))
+        .then(() => addIfMissing('panel_message_id', 'TEXT'))
+        .then(() => addIfMissing('timezone', 'TEXT'))
+        .then(() => addIfMissing('panel_gif_url', 'TEXT'))
+        .then(() => addIfMissing('panel_logo_url', 'TEXT'))
+        .then(() => addIfMissing('bitacora_role_ids', 'TEXT'))
+        .then(() => resolve());
+    });
+  });
+}
+
+// Llama a la migración en el arranque:
+ensureGuildConfigColumns().then(() => {
+  console.log('Esquema guild_config verificado/migrado');
+}).catch(() => {});
+
+
 // ---------- HELPERS CONFIG ----------
 function getGuildConfig(guildId) {
   return new Promise((resolve) => {
