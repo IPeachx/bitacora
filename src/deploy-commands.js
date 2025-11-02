@@ -6,6 +6,18 @@ const commands = [
   new SlashCommandBuilder()
     .setName('bitacora')
     .setDescription('Comandos de la bitácora')
+    .addSubcommand(sc =>
+  sc
+    .setName('refresh')
+    .setDescription('Refresca o republica el panel si hace falta')
+    .addChannelOption(o =>
+      o.setName('canal')
+       .setDescription('Opcional: especifica canal para republicar')
+       .addChannelTypes(ChannelType.GuildText)
+       .setRequired(false)
+    )
+)
+
     // /bitacora panel
     .addSubcommand(sc =>
       sc
