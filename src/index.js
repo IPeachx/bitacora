@@ -27,13 +27,14 @@ const __dirname = path.dirname(__filename);
 
 const TZ = process.env.TIMEZONE || 'America/Mexico_City';
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'bitacora.db');
+
 const BITACORA_ROLE_IDS = (process.env.BITACORA_ROLE_IDS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
-const PING_EVERY_MIN = parseInt(process.env.PING_EVERY_MIN || '120', 10);
-const PING_TIMEOUT_MIN = parseInt(process.env.PING_TIMEOUT_MIN || '5', 10);
+const PING_EVERY_MIN = parseInt(process.env.PING_EVERY_MIN || '120', 10);  // cada cuánto preguntar
+const PING_TIMEOUT_MIN = parseInt(process.env.PING_TIMEOUT_MIN || '5', 10); // autocierre si no responde
 const NIGHTLY_UPLOAD = String(process.env.NIGHTLY_BACKUP_UPLOAD || 'false').toLowerCase() === 'true';
 
 const DATA_DIR = path.join(__dirname, '..');
@@ -223,7 +224,7 @@ function getPeriodRange(period, timezone) {
 }
 
 // ------------------------------
-// Discord client (incluye DMs para pings)
+// Discord client
 // ------------------------------
 const client = new Client({
   intents: [
@@ -278,29 +279,45 @@ function buildPanelButtons() {
   );
 }
 
-async function refreshPanel(guildId) {
-  const cfg = await getGuildConfig(guildId);
-  if (!cfg?.panel_channel_id || !cfg?.panel_message_id) return;
+// Auto-reparable: edita si existe; si falla, republica y guarda el nuevo ID
+async function refreshPanel(guildId, forceChannelId) {
+  const cfgRaw = await getGuildConfig(guildId);
+  const cfg = cfgRaw || { guild_id: guildId, timezone: TZ, stellar_windows: '00:00-02:00,16:00-18:00' };
+
+  const openUsers = await new Promise(res =>
+    db.all(
+      `SELECT user_id FROM sessions WHERE guild_id=? AND status='open'`,
+      [guildId],
+      (e, rows = []) => res(rows.map(r => r.user_id))
+    )
+  );
+  const tags = openUsers.length ? openUsers.map(id => `<@${id}>`).join(' ') : '—';
 
   const guild = await client.guilds.fetch(guildId).catch(() => null);
   if (!guild) return;
 
-  const ch = await guild.channels.fetch(cfg.panel_channel_id).catch(() => null);
+  const channelId = forceChannelId || cfg.panel_channel_id;
+  if (!channelId) return;
+
+  const ch = await guild.channels.fetch(channelId).catch(() => null);
   if (!ch || ch.type !== ChannelType.GuildText) return;
 
-  const msg = await ch.messages.fetch(cfg.panel_message_id).catch(() => null);
-  if (!msg) return;
+  const embed = buildPanelEmbed(tags, cfg);
+  const row = buildPanelButtons();
 
-  db.all(
-    `SELECT user_id FROM sessions WHERE guild_id=? AND status='open'`,
-    [guildId],
-    async (e, rows = []) => {
-      const tags = rows.length ? rows.map(r => `<@${r.user_id}>`).join(' ') : '—';
-      const embed = buildPanelEmbed(tags, cfg);
-      const row = buildPanelButtons();
-      await msg.edit({ embeds: [embed], components: [row] });
+  if (cfg.panel_message_id) {
+    const msg = await ch.messages.fetch(cfg.panel_message_id).catch(() => null);
+    if (msg) {
+      await msg.edit({ embeds: [embed], components: [row] }).catch(async () => {
+        const newMsg = await ch.send({ embeds: [embed], components: [row] }).catch(() => null);
+        if (newMsg) await upsertGuildConfig({ guild_id: guildId, panel_channel_id: ch.id, panel_message_id: newMsg.id });
+      });
+      return;
     }
-  );
+  }
+
+  const newMsg = await ch.send({ embeds: [embed], components: [row] }).catch(() => null);
+  if (newMsg) await upsertGuildConfig({ guild_id: guildId, panel_channel_id: ch.id, panel_message_id: newMsg.id });
 }
 
 // ------------------------------
@@ -359,7 +376,6 @@ async function closeSessionCompute(session) {
     db.all(`SELECT pause_start, pause_end FROM pauses WHERE session_id=?`, [session.id], (e, r = []) => res(r))
   );
 
-  // minutos efectivos
   const activeMin = minutesMinusPauses(session.start_at, end, pauses);
   const cfg = await getGuildConfig(session.guild_id);
   const tz = cfg?.timezone || TZ;
@@ -377,7 +393,7 @@ async function closeSessionCompute(session) {
       () => res()
     )
   );
-  return split; // {normales, estelares}
+  return split;
 }
 
 // ------------------------------
@@ -488,7 +504,7 @@ async function nightlyBackupForGuild(guildId) {
   }
 }
 
-// CRON: semana y noche
+// CRON: semana (viernes 17:00 CDMX) y noche (03:30)
 cron.schedule('0 17 * * 5', async () => {
   for (const g of client.guilds.cache.values()) await weeklyArchive(g.id);
 }, { timezone: TZ });
@@ -519,13 +535,11 @@ cron.schedule('*/5 * * * *', async () => {
               new ButtonBuilder().setCustomId(`ping_close:${s.id}`).setLabel('Cerrar ahora').setStyle(ButtonStyle.Danger),
             );
 
-            // DM primero
             const user = await client.users.fetch(s.user_id).catch(()=>null);
             let sent = false;
             if (user) {
               sent = await user.send({ content: '¿Sigues en servicio?', components: [row] }).then(()=>true).catch(()=>false);
             }
-            // Fallback a logs si DM falla
             if (!sent) {
               const ch = cfg?.logs_channel_id ? await guild.channels.fetch(cfg.logs_channel_id).catch(()=>null) : null;
               await ch?.send({ content: `<@${s.user_id}> ¿Sigues en servicio?`, components: [row] });
@@ -559,6 +573,9 @@ client.on('interactionCreate', async (interaction) => {
         const sub = interaction.options.getSubcommand();
 
         if (sub === 'panel') {
+          if (!(await userHasBitacoraAccess(interaction))) {
+            return interaction.reply({ content: 'No tienes permisos para usar este comando.', ephemeral: true });
+          }
           const ch = interaction.options.getChannel('canal', true);
           if (ch.type !== ChannelType.GuildText)
             return interaction.reply({ content: 'El canal debe ser de texto.', ephemeral: true });
@@ -569,10 +586,24 @@ client.on('interactionCreate', async (interaction) => {
 
           const msg = await ch.send({ embeds: [embed], components: [row] });
           await upsertGuildConfig({ guild_id: interaction.guildId, panel_channel_id: ch.id, panel_message_id: msg.id });
+          await refreshPanel(interaction.guildId); // pinta estado real
           return interaction.reply({ content: 'Panel publicado/actualizado ✅', ephemeral: true });
         }
 
+        if (sub === 'refresh') {
+          if (!(await userHasBitacoraAccess(interaction))) {
+            return interaction.reply({ content: 'No tienes permisos para usar este comando.', ephemeral: true });
+          }
+          const ch = interaction.options.getChannel('canal');
+          const channelId = ch?.id;
+          await refreshPanel(interaction.guildId, channelId);
+          return interaction.reply({ content: 'Panel refrescado ✅', ephemeral: true });
+        }
+
         if (sub === 'config') {
+          if (!(await userHasBitacoraAccess(interaction))) {
+            return interaction.reply({ content: 'No tienes permisos para usar este comando.', ephemeral: true });
+          }
           const updates = { guild_id: interaction.guildId };
           const chLogs = interaction.options.getChannel('canal_logs');
           const every = interaction.options.getInteger('ping_cada_min');
@@ -614,7 +645,6 @@ client.on('interactionCreate', async (interaction) => {
             new ButtonBuilder().setCustomId('x1').setLabel('Sí, sigo en servicio').setStyle(ButtonStyle.Success).setDisabled(true),
             new ButtonBuilder().setCustomId('x2').setLabel('Cerrar ahora').setStyle(ButtonStyle.Danger).setDisabled(true),
           );
-          // Si fue en DM, usamos update; si fue en canal, igual.
           return interaction.update({ content: '¡Perfecto! Seguimos contando tu servicio 💪', components: [row] }).catch(async ()=>{
             await interaction.reply({ content:'¡Perfecto! Seguimos contando tu servicio 💪', ephemeral:true }).catch(()=>{});
           });
@@ -692,7 +722,7 @@ async function handleAll(interaction) {
 
   const totals = new Map(); // userId -> { n, e }
 
-  // Suma de sessions + history
+  // Suma sessions + history
   await new Promise(res => {
     db.all(
       `
@@ -712,7 +742,7 @@ async function handleAll(interaction) {
     );
   });
 
-  // Añadimos lo abierto ahora (recalculado por ventanas)
+  // Añadir abiertas ahora (recalculadas)
   const cfg = await getGuildConfig(guildId);
   const tz = cfg?.timezone || TZ;
   const windows = parseWindows(cfg?.stellar_windows || '00:00-02:00,16:00-18:00');
@@ -767,7 +797,7 @@ async function handleTop(interaction, periodo) {
   const range = getPeriodRange(periodo, tz);
   if (!range) return interaction.editReply('Período inválido.');
 
-  // 1) Sumar sesiones CERRADAS actuales (recalcular por rango + pausas)
+  // 1) sesiones cerradas actuales (recalcular por rango + pausas)
   const closed = await new Promise(res => db.all(
     `SELECT s.*, p.pause_start, p.pause_end
      FROM sessions s
@@ -777,7 +807,6 @@ async function handleTop(interaction, periodo) {
     (e, rows=[]) => res(rows)
   ));
 
-  // agrupamos por sesión para tener todas sus pausas
   const pausesBySession = new Map();
   for (const r of closed) {
     if (!pausesBySession.has(r.id)) pausesBySession.set(r.id, []);
@@ -789,11 +818,10 @@ async function handleTop(interaction, periodo) {
   ));
 
   const sums = new Map(); // userId -> {n,e}
-
-  function add(userId, n, e) {
-    const prev = sums.get(userId) || { n:0, e:0 };
-    sums.set(userId, { n: prev.n + n, e: prev.e + e });
-  }
+  const add = (u,n,e) => {
+    const prev = sums.get(u) || {n:0,e:0};
+    sums.set(u, { n: prev.n + n, e: prev.e + e });
+  };
 
   for (const s of baseClosed) {
     const from = Math.max(s.start_at, range.from);
@@ -808,7 +836,7 @@ async function handleTop(interaction, periodo) {
     add(s.user_id, split.normales, split.estelares);
   }
 
-  // 2) Sumar sesiones ABIERTAS (hasta ahora)
+  // 2) abiertas (hasta ahora)
   const openRows = await new Promise(res =>
     db.all(`SELECT id, user_id, start_at FROM sessions WHERE guild_id=? AND status='open'`,
       [guildId], (e,r=[]) => res(r))
@@ -828,7 +856,7 @@ async function handleTop(interaction, periodo) {
     add(s.user_id, split.normales, split.estelares);
   }
 
-  // 3) Sumar sessions_history (aprox: registros cuyo end_at cae dentro del rango)
+  // 3) history (aprox: registros cuyo end_at cae dentro del rango)
   const histRows = await new Promise(res =>
     db.all(
       `SELECT user_id, min_normales, min_estelares, end_at
